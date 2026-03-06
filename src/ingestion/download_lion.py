@@ -1,10 +1,11 @@
 """Download NYC Street Centerline (CSCL) data and produce to Kafka.
 
-Fetches street segments from the NYC Open Data Socrata SODA API (dataset
-exjm-f27b), transforms to match the street_segments schema, and streams
+Fetches street segments from the NYC Open Data Socrata GeoJSON API (dataset
+3mf9-qshr), transforms to match the street_segments schema, and streams
 records to Kafka for PostGIS loading. No local files are written.
 """
 
+import io
 import logging
 import os
 
@@ -12,19 +13,19 @@ import geopandas as gpd
 import pandas as pd
 import requests
 from kafka import KafkaProducer
-from shapely.geometry import LineString, shape
 
 from src.ingestion.kafka_config import END_OF_STREAM, KAFKA_BOOTSTRAP, TOPICS, serialize
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# NYC Street Centerline (CSCL) on NYC Open Data — Socrata SODA API
+# NYC Street Centerline (CSCL) on NYC Open Data — Socrata GeoJSON API
 CSCL_DATASET_ID = os.environ.get("CSCL_DATASET_ID", "3mf9-qshr")
 SOCRATA_DOMAIN = "data.cityofnewyork.us"
 SOCRATA_APP_TOKEN = os.environ.get("SOCRATA_APP_TOKEN", "")
 
-BASE_URL = f"https://{SOCRATA_DOMAIN}/resource/{CSCL_DATASET_ID}.json"
+# Use GeoJSON endpoint so geometry is included
+BASE_URL = f"https://{SOCRATA_DOMAIN}/resource/{CSCL_DATASET_ID}.geojson"
 PAGE_SIZE = 50_000
 
 BOROUGH_MAP = {
@@ -40,9 +41,9 @@ ROAD_CLASS_MAP = {
 }
 
 
-def fetch_all_records() -> pd.DataFrame:
-    """Paginate through the CSCL dataset via SODA API."""
-    all_records: list[dict] = []
+def fetch_all_records() -> gpd.GeoDataFrame:
+    """Paginate through the CSCL dataset via Socrata GeoJSON API."""
+    all_gdfs: list[gpd.GeoDataFrame] = []
     offset = 0
 
     while True:
@@ -56,57 +57,34 @@ def fetch_all_records() -> pd.DataFrame:
 
         resp = requests.get(BASE_URL, params=params, timeout=300)
         resp.raise_for_status()
-        page = resp.json()
 
-        if not page:
+        # Parse GeoJSON response directly with geopandas
+        gdf = gpd.read_file(io.BytesIO(resp.content))
+
+        if gdf.empty:
             break
-        all_records.extend(page)
-        if len(page) < PAGE_SIZE:
+
+        all_gdfs.append(gdf)
+        logger.info("  Got %d features", len(gdf))
+
+        if len(gdf) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
 
-    logger.info("Total CSCL records fetched: %d", len(all_records))
-    return pd.DataFrame(all_records) if all_records else pd.DataFrame()
+    if not all_gdfs:
+        logger.warning("No records returned from CSCL API")
+        return gpd.GeoDataFrame()
 
-
-def to_geodataframe(df: pd.DataFrame) -> gpd.GeoDataFrame:
-    """Convert Socrata JSON rows (with nested geometry) to GeoDataFrame."""
-    df.columns = [c.lower().strip() for c in df.columns]
-
-    # Socrata returns geometry in a column like 'the_geom' as a dict
-    geom_col = None
-    for candidate in ["the_geom", "geometry", "geom", "shape"]:
-        if candidate in df.columns:
-            geom_col = candidate
-            break
-
-    if geom_col is None:
-        raise ValueError(f"No geometry column found. Columns: {list(df.columns)}")
-
-    geometries = []
-    valid_mask = []
-    for g in df[geom_col]:
-        try:
-            if isinstance(g, dict):
-                geometries.append(shape(g))
-                valid_mask.append(True)
-            else:
-                geometries.append(None)
-                valid_mask.append(False)
-        except Exception:
-            geometries.append(None)
-            valid_mask.append(False)
-
-    df = df.drop(columns=[geom_col])
-    gdf = gpd.GeoDataFrame(df, geometry=geometries, crs="EPSG:4326")
-    gdf = gdf[valid_mask].copy()
-
-    logger.info("Converted %d records to GeoDataFrame", len(gdf))
-    return gdf
+    combined = pd.concat(all_gdfs, ignore_index=True)
+    combined = gpd.GeoDataFrame(combined, geometry="geometry", crs="EPSG:4326")
+    logger.info("Total CSCL features fetched: %d", len(combined))
+    return combined
 
 
 def transform(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Transform CSCL data to match the street_segments schema."""
+    gdf.columns = [c.lower().strip() for c in gdf.columns]
+
     if gdf.crs and gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
@@ -150,7 +128,7 @@ def transform(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     out["length_ft"] = projected.geometry.length
 
     # Keep only LineString geometries
-    out = out[out.geometry.geom_type == "LineString"].copy()
+    out = out[out.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
     out = out.drop_duplicates(subset="segment_id", keep="first")
     out = out[out["segment_id"].str.len() > 0]
     out = out.rename(columns={"geometry": "geom"}).set_geometry("geom")
@@ -180,11 +158,10 @@ def produce(gdf: gpd.GeoDataFrame) -> None:
 
 def main() -> None:
     logger.info("Starting LION street centerline download")
-    df = fetch_all_records()
-    if df.empty:
+    gdf = fetch_all_records()
+    if gdf.empty:
         logger.warning("No records returned from CSCL API")
         return
-    gdf = to_geodataframe(df)
     gdf = transform(gdf)
     produce(gdf)
     logger.info("Done. %d street segments produced.", len(gdf))
