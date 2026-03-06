@@ -1,27 +1,31 @@
-"""Download NYC LION street centerline network and produce to Kafka.
+"""Download NYC Street Centerline (CSCL) data and produce to Kafka.
 
-Fetches the LION geodatabase from NYC Open Data / DCP, extracts street
-segments, computes lengths, and streams records to Kafka for PostGIS loading.
+Fetches street segments from the NYC Open Data Socrata SODA API (dataset
+exjm-f27b), transforms to match the street_segments schema, and streams
+records to Kafka for PostGIS loading. No local files are written.
 """
 
-import io
 import logging
 import os
-import zipfile
 
 import geopandas as gpd
+import pandas as pd
 import requests
 from kafka import KafkaProducer
+from shapely.geometry import LineString, shape
 
 from src.ingestion.kafka_config import END_OF_STREAM, KAFKA_BOOTSTRAP, TOPICS, serialize
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-LION_URL = os.environ.get(
-    "LION_URL",
-    "https://data.cityofnewyork.us/api/geospatial/exjm-f27b?method=export&type=GeoJSON",
-)
+# NYC Street Centerline (CSCL) on NYC Open Data — Socrata SODA API
+CSCL_DATASET_ID = os.environ.get("CSCL_DATASET_ID", "exjm-f27b")
+SOCRATA_DOMAIN = "data.cityofnewyork.us"
+SOCRATA_APP_TOKEN = os.environ.get("SOCRATA_APP_TOKEN", "")
+
+BASE_URL = f"https://{SOCRATA_DOMAIN}/resource/{CSCL_DATASET_ID}.json"
+PAGE_SIZE = 50_000
 
 BOROUGH_MAP = {
     "1": "Manhattan", "2": "Bronx", "3": "Brooklyn",
@@ -36,37 +40,73 @@ ROAD_CLASS_MAP = {
 }
 
 
-def download_lion() -> gpd.GeoDataFrame:
-    """Download LION data into memory and return as GeoDataFrame."""
-    logger.info("Downloading LION street centerline from %s", LION_URL)
-    resp = requests.get(LION_URL, timeout=300, stream=True)
-    resp.raise_for_status()
+def fetch_all_records() -> pd.DataFrame:
+    """Paginate through the CSCL dataset via SODA API."""
+    all_records: list[dict] = []
+    offset = 0
 
-    content = resp.content
-    content_type = resp.headers.get("Content-Type", "")
+    while True:
+        logger.info("Fetching offset %d ...", offset)
+        params: dict = {
+            "$limit": PAGE_SIZE,
+            "$offset": offset,
+        }
+        if SOCRATA_APP_TOKEN:
+            params["$$app_token"] = SOCRATA_APP_TOKEN
 
-    if "zip" in content_type or LION_URL.endswith(".zip"):
-        logger.info("Extracting ZIP archive in memory")
-        with zipfile.ZipFile(io.BytesIO(content)) as zf:
-            shp_names = [n for n in zf.namelist() if n.endswith(".shp")]
-            geojson_names = [n for n in zf.namelist() if n.endswith(".geojson")]
-            if shp_names:
-                gdf = gpd.read_file(io.BytesIO(content), layer=shp_names[0])
-            elif geojson_names:
-                gdf = gpd.read_file(io.BytesIO(zf.read(geojson_names[0])))
+        resp = requests.get(BASE_URL, params=params, timeout=300)
+        resp.raise_for_status()
+        page = resp.json()
+
+        if not page:
+            break
+        all_records.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+
+    logger.info("Total CSCL records fetched: %d", len(all_records))
+    return pd.DataFrame(all_records) if all_records else pd.DataFrame()
+
+
+def to_geodataframe(df: pd.DataFrame) -> gpd.GeoDataFrame:
+    """Convert Socrata JSON rows (with nested geometry) to GeoDataFrame."""
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    # Socrata returns geometry in a column like 'the_geom' as a dict
+    geom_col = None
+    for candidate in ["the_geom", "geometry", "geom", "shape"]:
+        if candidate in df.columns:
+            geom_col = candidate
+            break
+
+    if geom_col is None:
+        raise ValueError(f"No geometry column found. Columns: {list(df.columns)}")
+
+    geometries = []
+    valid_mask = []
+    for g in df[geom_col]:
+        try:
+            if isinstance(g, dict):
+                geometries.append(shape(g))
+                valid_mask.append(True)
             else:
-                raise FileNotFoundError("No shapefile or GeoJSON found in ZIP")
-    else:
-        gdf = gpd.read_file(io.BytesIO(content))
+                geometries.append(None)
+                valid_mask.append(False)
+        except Exception:
+            geometries.append(None)
+            valid_mask.append(False)
 
-    logger.info("Loaded %d features", len(gdf))
+    df = df.drop(columns=[geom_col])
+    gdf = gpd.GeoDataFrame(df, geometry=geometries, crs="EPSG:4326")
+    gdf = gdf[valid_mask].copy()
+
+    logger.info("Converted %d records to GeoDataFrame", len(gdf))
     return gdf
 
 
 def transform(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Transform LION data to match the street_segments schema."""
-    gdf.columns = [c.lower() for c in gdf.columns]
-
+    """Transform CSCL data to match the street_segments schema."""
     if gdf.crs and gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
@@ -105,9 +145,11 @@ def transform(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     else:
         out["snow_emergency"] = False
 
+    # Compute segment length in feet using a projected CRS (EPSG:2263 = NY State Plane)
     projected = out.to_crs(epsg=2263)
     out["length_ft"] = projected.geometry.length
 
+    # Keep only LineString geometries
     out = out[out.geometry.geom_type == "LineString"].copy()
     out = out.drop_duplicates(subset="segment_id", keep="first")
     out = out[out["segment_id"].str.len() > 0]
@@ -138,7 +180,11 @@ def produce(gdf: gpd.GeoDataFrame) -> None:
 
 def main() -> None:
     logger.info("Starting LION street centerline download")
-    gdf = download_lion()
+    df = fetch_all_records()
+    if df.empty:
+        logger.warning("No records returned from CSCL API")
+        return
+    gdf = to_geodataframe(df)
     gdf = transform(gdf)
     produce(gdf)
     logger.info("Done. %d street segments produced.", len(gdf))
