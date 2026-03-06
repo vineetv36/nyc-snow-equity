@@ -42,32 +42,48 @@ def fetch_aggregated() -> pd.DataFrame:
         params["$$app_token"] = SOCRATA_APP_TOKEN
 
     logger.info("Fetching aggregated ridership via SoQL ...")
-    resp = requests.get(SODA_URL, params=params, timeout=120)
+    resp = requests.get(SODA_URL, params=params, timeout=300)
     resp.raise_for_status()
     df = pd.read_csv(io.StringIO(resp.text))
+    if df.empty:
+        raise ValueError("SoQL returned empty result")
     logger.info("Got %d routes via SoQL aggregation", len(df))
     return df
 
 
 def fetch_csv_bulk() -> pd.DataFrame:
-    """Stream full CSV download and aggregate locally (fallback)."""
-    logger.info("Falling back to CSV bulk download ...")
-    resp = requests.get(CSV_DOWNLOAD_URL, timeout=300, stream=True)
-    resp.raise_for_status()
+    """Stream CSV download in chunks and aggregate locally (fallback)."""
+    logger.info("Falling back to CSV bulk download (streaming) ...")
 
-    # Read in chunks to keep memory bounded
-    chunks = pd.read_csv(
-        io.StringIO(resp.text),
+    agg = {}
+    row_count = 0
+    chunk_iter = pd.read_csv(
+        CSV_DOWNLOAD_URL,
         usecols=["bus_route", "ridership", "transfers"],
         dtype={"bus_route": str, "ridership": float, "transfers": float},
+        chunksize=100_000,
     )
-    logger.info("Downloaded %d rows, aggregating ...", len(chunks))
+    for chunk in chunk_iter:
+        row_count += len(chunk)
+        if row_count % 500_000 == 0 or row_count == len(chunk):
+            logger.info("  streamed %d rows so far ...", row_count)
+        partial = chunk.groupby("bus_route", as_index=False).agg(
+            total_ridership=("ridership", "sum"),
+            total_transfers=("transfers", "sum"),
+        )
+        for _, r in partial.iterrows():
+            route = r["bus_route"]
+            if route in agg:
+                agg[route][0] += r["total_ridership"]
+                agg[route][1] += r["total_transfers"]
+            else:
+                agg[route] = [r["total_ridership"], r["total_transfers"]]
 
-    df = (
-        chunks.groupby("bus_route", as_index=False)
-        .agg(total_ridership=("ridership", "sum"), total_transfers=("transfers", "sum"))
+    logger.info("Streamed %d total rows, aggregated to %d routes", row_count, len(agg))
+    df = pd.DataFrame(
+        [(k, v[0], v[1]) for k, v in agg.items()],
+        columns=["bus_route", "total_ridership", "total_transfers"],
     )
-    logger.info("Aggregated to %d routes", len(df))
     return df
 
 
@@ -76,7 +92,8 @@ def fetch_all_records() -> pd.DataFrame:
     try:
         return fetch_aggregated()
     except Exception as exc:
-        logger.warning("SoQL aggregation failed (%s), using CSV fallback", exc)
+        logger.warning("SoQL aggregation failed: %s: %s", type(exc).__name__, exc)
+        logger.info("Using CSV streaming fallback ...")
         return fetch_csv_bulk()
 
 
