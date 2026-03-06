@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # NYC Street Centerline (CSCL) on NYC Open Data — Socrata SODA API
-CSCL_DATASET_ID = os.environ.get("CSCL_DATASET_ID", "exjm-f27b")
+CSCL_DATASET_ID = os.environ.get("CSCL_DATASET_ID", "3mf9-qshr")
 SOCRATA_DOMAIN = "data.cityofnewyork.us"
 SOCRATA_APP_TOKEN = os.environ.get("SOCRATA_APP_TOKEN", "")
 
