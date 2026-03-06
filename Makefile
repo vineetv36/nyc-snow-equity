@@ -1,3 +1,6 @@
+PYTHON ?= python3
+PIP ?= pip3
+
 .PHONY: help setup db db-stop db-logs download-all pipeline api live test clean
 
 help: ## Show this help
@@ -7,7 +10,7 @@ help: ## Show this help
 # Setup
 # ---------------------------------------------------------------------------
 setup: ## Install Python dependencies
-	pip install -r requirements.txt
+	$(PIP) install -r requirements.txt
 
 # ---------------------------------------------------------------------------
 # Database
@@ -28,25 +31,25 @@ db-logs: ## Tail database logs
 # Data ingestion
 # ---------------------------------------------------------------------------
 download-all: ## Download all datasets (~15 min first time)
-	python -m src.ingestion.run_all
+	$(PYTHON) -m src.ingestion.run_all
 
 download-lion: ## Download LION street centerlines only
-	python -m src.ingestion.download_lion
+	$(PYTHON) -m src.ingestion.download_lion
 
 download-ridership: ## Download MTA bus ridership only
-	python -m src.ingestion.download_mta_ridership
+	$(PYTHON) -m src.ingestion.download_mta_ridership
 
 download-stops: ## Download GTFS bus stops only
-	python -m src.ingestion.download_bus_stops
+	$(PYTHON) -m src.ingestion.download_bus_stops
 
 download-plow: ## Download PlowNYC GPS data only
-	python -m src.ingestion.download_plow_data
+	$(PYTHON) -m src.ingestion.download_plow_data
 
 download-pedestrian: ## Download pedestrian counts only
-	python -m src.ingestion.download_pedestrian
+	$(PYTHON) -m src.ingestion.download_pedestrian
 
 download-census: ## Download Census ACS demographics only
-	python -m src.ingestion.download_census
+	$(PYTHON) -m src.ingestion.download_census
 
 # ---------------------------------------------------------------------------
 # Processing pipeline
