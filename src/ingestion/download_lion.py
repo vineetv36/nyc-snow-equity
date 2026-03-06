@@ -84,16 +84,17 @@ def fetch_all_records() -> gpd.GeoDataFrame:
 def transform(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Transform CSCL data to match the street_segments schema."""
     gdf.columns = [c.lower().strip() for c in gdf.columns]
+    logger.info("Available columns: %s", list(gdf.columns))
 
     if gdf.crs and gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
     col_candidates = {
         "segment_id": ["physicalid", "segmentid", "segment_id", "segid", "lion_id"],
-        "street_name": ["full_stree", "st_label", "street", "stname", "street_name"],
+        "street_name": ["st_name", "full_stree", "st_label", "street", "stname", "street_name"],
         "from_street": ["l_from_st", "from_st", "frm_st", "from_street"],
         "to_street": ["l_to_st", "to_st", "to_street"],
-        "borough": ["borocode", "boro", "borough", "rw_type"],
+        "borough": ["borocode", "boro", "borough"],
         "road_class": ["rw_type", "roadway_type", "feature_ty", "featuretyp", "road_class"],
     }
 
@@ -112,14 +113,22 @@ def transform(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             logger.warning("No column found for %s (tried %s)", target, candidates)
 
     out["segment_id"] = out["segment_id"].str.strip()
+
+    # If no segment_id column was found, generate from index
+    if (out["segment_id"] == "").all():
+        logger.info("No segment_id column matched; generating from row index")
+        out["segment_id"] = [str(i) for i in range(len(out))]
+
     out["borough"] = out["borough"].map(BOROUGH_MAP).fillna(out["borough"])
 
     if out["road_class"].str.match(r"^\d$").any():
         out["road_class"] = out["road_class"].map(ROAD_CLASS_MAP).fillna("other")
 
-    snow_cols = [c for c in gdf.columns if "snow" in c.lower()]
+    # SNOW_PRI = snow removal priority designation
+    snow_cols = [c for c in gdf.columns if "snow" in c]
     if snow_cols:
-        out["snow_emergency"] = gdf[snow_cols[0]].astype(bool)
+        # Any non-empty/non-null snow priority means it's a snow route
+        out["snow_emergency"] = gdf[snow_cols[0]].fillna("").astype(str).str.strip().ne("")
     else:
         out["snow_emergency"] = False
 
