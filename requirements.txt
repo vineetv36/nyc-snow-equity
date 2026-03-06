@@ -1,0 +1,11 @@
+requests>=2.31
+pandas>=2.1
+geopandas>=0.14
+pyarrow>=14.0
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+GeoAlchemy2>=0.14
+shapely>=2.0
+sodapy>=2.2
+cenpy>=1.0
+fiona>=1.9
