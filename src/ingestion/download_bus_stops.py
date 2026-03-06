@@ -1,8 +1,8 @@
-"""Download MTA GTFS bus stop locations and load into PostGIS.
+"""Download MTA GTFS bus stop locations and produce to Kafka.
 
 Fetches the MTA GTFS feed, extracts stops.txt for bus stop coordinates,
-joins with ridership data if available, saves as GeoJSON, and loads into
-the bus_stops PostGIS table.
+joins with ridership data from the ridership Kafka topic, and streams
+to Kafka for PostGIS loading.
 """
 
 import csv
@@ -10,24 +10,29 @@ import io
 import logging
 import os
 import zipfile
-from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
 import requests
+from kafka import KafkaConsumer, KafkaProducer
 from shapely.geometry import Point
-from sqlalchemy import create_engine, text
+
+from src.ingestion.kafka_config import (
+    END_OF_STREAM,
+    KAFKA_BOOTSTRAP,
+    TOPICS,
+    deserialize,
+    serialize,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# MTA GTFS Bus feed URL
-GTFS_URL = os.environ.get(
+MTA_GTFS_BUS_URL = os.environ.get(
     "MTA_GTFS_BUS_URL",
     "http://web.mta.info/developers/data/nyct/bus/google_transit_bronx.zip",
 )
 
-# Multiple borough GTFS feeds
 GTFS_FEEDS = {
     "bronx": "http://web.mta.info/developers/data/nyct/bus/google_transit_bronx.zip",
     "brooklyn": "http://web.mta.info/developers/data/nyct/bus/google_transit_brooklyn.zip",
@@ -36,17 +41,9 @@ GTFS_FEEDS = {
     "staten_island": "http://web.mta.info/developers/data/nyct/bus/google_transit_staten_island.zip",
 }
 
-RAW_DIR = Path("data/raw/bus_stops")
-RIDERSHIP_PATH = Path("data/raw/mta_ridership/mta_bus_ridership.parquet")
-
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://snow_user:snow_pass@localhost:5432/nyc_snow_equity",
-)
-
 
 def download_gtfs_stops(url: str) -> pd.DataFrame:
-    """Download a GTFS ZIP and extract stops.txt."""
+    """Download a GTFS ZIP in memory and extract stops.txt."""
     logger.info("Downloading GTFS feed from %s", url)
     resp = requests.get(url, timeout=120)
     resp.raise_for_status()
@@ -76,13 +73,39 @@ def fetch_all_stops() -> pd.DataFrame:
         raise RuntimeError("Could not download any GTFS feeds")
 
     combined = pd.concat(all_stops, ignore_index=True)
-    # Deduplicate stops that appear in multiple feeds
     combined = combined.drop_duplicates(subset="stop_id", keep="first")
     logger.info("Total unique stops across all boroughs: %d", len(combined))
     return combined
 
 
-def transform(df: pd.DataFrame) -> gpd.GeoDataFrame:
+def read_ridership_from_kafka() -> dict[str, float]:
+    """Read ridership records from Kafka topic to build stop_id → avg_daily_riders map."""
+    rider_map: dict[str, float] = {}
+    try:
+        consumer = KafkaConsumer(
+            TOPICS["mta_ridership"],
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            auto_offset_reset="earliest",
+            group_id="bus-stops-ridership-reader",
+            consumer_timeout_ms=15_000,
+        )
+        for msg in consumer:
+            raw = msg.value.decode("utf-8")
+            if raw == END_OF_STREAM:
+                break
+            record = deserialize(msg.value)
+            stop_id = str(record.get("stop_id", "")).strip()
+            riders = float(record.get("avg_daily_riders", 0))
+            if stop_id:
+                rider_map[stop_id] = riders
+        consumer.close()
+        logger.info("Read %d ridership entries from Kafka", len(rider_map))
+    except Exception as e:
+        logger.warning("Could not read ridership from Kafka: %s", e)
+    return rider_map
+
+
+def transform(df: pd.DataFrame, rider_map: dict[str, float]) -> gpd.GeoDataFrame:
     """Transform GTFS stops into GeoDataFrame matching bus_stops schema."""
     df["stop_lat"] = pd.to_numeric(df["stop_lat"], errors="coerce")
     df["stop_lon"] = pd.to_numeric(df["stop_lon"], errors="coerce")
@@ -91,74 +114,41 @@ def transform(df: pd.DataFrame) -> gpd.GeoDataFrame:
     geometry = [Point(lon, lat) for lon, lat in zip(df["stop_lon"], df["stop_lat"])]
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
 
-    # Rename to match schema
-    gdf = gdf.rename(columns={"stop_name": "stop_name"})
     gdf["stop_id"] = gdf["stop_id"].astype(str).str.strip()
-
-    # Count routes per stop if routes.txt / stop_times.txt info is available
-    # For now, default to 1; this will be enriched later
     gdf["route_count"] = 1
+    gdf["avg_daily_riders"] = gdf["stop_id"].map(rider_map).fillna(0.0)
 
-    # Join ridership data if available
-    gdf["avg_daily_riders"] = 0.0
-    if RIDERSHIP_PATH.exists():
-        logger.info("Joining ridership data from %s", RIDERSHIP_PATH)
-        ridership = pd.read_parquet(RIDERSHIP_PATH)
-        if "stop_id" in ridership.columns and "avg_daily_riders" in ridership.columns:
-            ridership["stop_id"] = ridership["stop_id"].astype(str).str.strip()
-            rider_map = ridership.set_index("stop_id")["avg_daily_riders"].to_dict()
-            gdf["avg_daily_riders"] = gdf["stop_id"].map(rider_map).fillna(0.0)
-            matched = (gdf["avg_daily_riders"] > 0).sum()
-            logger.info("Matched ridership for %d / %d stops", matched, len(gdf))
+    matched = (gdf["avg_daily_riders"] > 0).sum()
+    logger.info("Matched ridership for %d / %d stops", matched, len(gdf))
 
-    # segment_id will be populated during the spatial join processing step
     result = gdf[["stop_id", "stop_name", "avg_daily_riders", "route_count"]].copy()
-    result = result.set_index(result.index)
     result = gpd.GeoDataFrame(result, geometry=gdf.geometry.rename("geom"), crs="EPSG:4326")
-
     return result
 
 
-def load_to_postgis(gdf: gpd.GeoDataFrame) -> None:
-    """Load bus stops into PostGIS.
+def produce(gdf: gpd.GeoDataFrame) -> None:
+    """Send each row to Kafka."""
+    producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
+    topic = TOPICS["bus_stops"]
 
-    Note: segment_id FK is NULL initially — it gets populated by the
-    ridership_joiner processing step after street segments are loaded.
-    """
-    engine = create_engine(DB_URL)
+    for _, row in gdf.iterrows():
+        record = row.drop("geom").to_dict()
+        record["geom"] = row.geom.wkt
+        producer.send(topic, value=serialize(record))
 
-    # We can't use the FK constraint on initial load since segment_id is null
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE bus_stops CASCADE"))
-
-    # Add segment_id column as NULL
-    gdf["segment_id"] = None
-
-    gdf.to_postgis(
-        "bus_stops",
-        engine,
-        if_exists="append",
-        index=False,
-        dtype={"geom": "Geometry(Point, 4326)"},
-    )
-    logger.info("Loaded %d bus stops into PostGIS", len(gdf))
-
-
-def save_raw(gdf: gpd.GeoDataFrame, output_dir: Path) -> None:
-    """Save as GeoJSON for reproducibility."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / "bus_stops.geojson"
-    gdf.to_file(out_path, driver="GeoJSON")
-    logger.info("Saved %s", out_path)
+    producer.send(topic, value=END_OF_STREAM.encode("utf-8"))
+    producer.flush()
+    producer.close()
+    logger.info("Produced %d records to %s", len(gdf), topic)
 
 
 def main() -> None:
     logger.info("Starting MTA GTFS bus stops download")
     df = fetch_all_stops()
-    gdf = transform(df)
-    save_raw(gdf, RAW_DIR)
-    load_to_postgis(gdf)
-    logger.info("Done. %d bus stops loaded.", len(gdf))
+    rider_map = read_ridership_from_kafka()
+    gdf = transform(df, rider_map)
+    produce(gdf)
+    logger.info("Done. %d bus stops produced.", len(gdf))
 
 
 if __name__ == "__main__":

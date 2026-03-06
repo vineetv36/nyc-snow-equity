@@ -9,3 +9,4 @@ shapely>=2.0
 sodapy>=2.2
 cenpy>=1.0
 fiona>=1.9
+kafka-python>=2.0
