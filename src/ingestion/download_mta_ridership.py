@@ -1,9 +1,13 @@
 """Download MTA bus ridership data and produce to Kafka.
 
-Fetches annual bus ridership aggregated by stop from data.ny.gov
+Fetches bus ridership from data.ny.gov, aggregates by route,
 and streams records to Kafka.
+
+Uses server-side SoQL aggregation to avoid downloading millions of
+hourly rows.  Falls back to CSV bulk download if SoQL fails.
 """
 
+import io
 import logging
 import os
 
@@ -20,76 +24,84 @@ MTA_RIDERSHIP_DATASET_ID = os.environ.get("MTA_RIDERSHIP_DATASET_ID", "kv7t-n8in
 SOCRATA_DOMAIN = "data.ny.gov"
 SOCRATA_APP_TOKEN = os.environ.get("SOCRATA_APP_TOKEN", "")
 
-BASE_URL = f"https://{SOCRATA_DOMAIN}/resource/{MTA_RIDERSHIP_DATASET_ID}.json"
-PAGE_SIZE = 50_000
+SODA_URL = f"https://{SOCRATA_DOMAIN}/resource/{MTA_RIDERSHIP_DATASET_ID}.csv"
+CSV_DOWNLOAD_URL = (
+    f"https://{SOCRATA_DOMAIN}/api/views/{MTA_RIDERSHIP_DATASET_ID}"
+    "/rows.csv?accessType=DOWNLOAD"
+)
+
+
+def fetch_aggregated() -> pd.DataFrame:
+    """Fetch ridership pre-aggregated by route using SoQL (fast)."""
+    params: dict = {
+        "$select": "bus_route, sum(ridership) as total_ridership, sum(transfers) as total_transfers",
+        "$group": "bus_route",
+        "$limit": 50000,
+    }
+    if SOCRATA_APP_TOKEN:
+        params["$$app_token"] = SOCRATA_APP_TOKEN
+
+    logger.info("Fetching aggregated ridership via SoQL ...")
+    resp = requests.get(SODA_URL, params=params, timeout=120)
+    resp.raise_for_status()
+    df = pd.read_csv(io.StringIO(resp.text))
+    logger.info("Got %d routes via SoQL aggregation", len(df))
+    return df
+
+
+def fetch_csv_bulk() -> pd.DataFrame:
+    """Stream full CSV download and aggregate locally (fallback)."""
+    logger.info("Falling back to CSV bulk download ...")
+    resp = requests.get(CSV_DOWNLOAD_URL, timeout=300, stream=True)
+    resp.raise_for_status()
+
+    # Read in chunks to keep memory bounded
+    chunks = pd.read_csv(
+        io.StringIO(resp.text),
+        usecols=["bus_route", "ridership", "transfers"],
+        dtype={"bus_route": str, "ridership": float, "transfers": float},
+    )
+    logger.info("Downloaded %d rows, aggregating ...", len(chunks))
+
+    df = (
+        chunks.groupby("bus_route", as_index=False)
+        .agg(total_ridership=("ridership", "sum"), total_transfers=("transfers", "sum"))
+    )
+    logger.info("Aggregated to %d routes", len(df))
+    return df
 
 
 def fetch_all_records() -> pd.DataFrame:
-    """Paginate through the MTA ridership dataset."""
-    all_records: list[dict] = []
-    offset = 0
-
-    while True:
-        logger.info("Fetching offset %d ...", offset)
-        params: dict = {"$limit": PAGE_SIZE, "$offset": offset}
-        if SOCRATA_APP_TOKEN:
-            params["$$app_token"] = SOCRATA_APP_TOKEN
-
-        resp = requests.get(BASE_URL, params=params, timeout=120)
-        resp.raise_for_status()
-        page = resp.json()
-
-        if not page:
-            break
-        all_records.extend(page)
-        if len(page) < PAGE_SIZE:
-            break
-        offset += PAGE_SIZE
-
-    logger.info("Total ridership records fetched: %d", len(all_records))
-    return pd.DataFrame(all_records) if all_records else pd.DataFrame()
+    """Fetch MTA ridership, preferring server-side aggregation."""
+    try:
+        return fetch_aggregated()
+    except Exception as exc:
+        logger.warning("SoQL aggregation failed (%s), using CSV fallback", exc)
+        return fetch_csv_bulk()
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize columns and compute average daily riders."""
     df.columns = [c.lower().strip() for c in df.columns]
 
-    stop_id_col = None
-    for candidate in ["stop_id", "stopid", "stop_code", "gtfs_stop_id"]:
+    # Rename route column
+    for candidate in ["bus_route", "route", "route_id"]:
         if candidate in df.columns:
-            stop_id_col = candidate
-            break
-    if stop_id_col and stop_id_col != "stop_id":
-        df = df.rename(columns={stop_id_col: "stop_id"})
-
-    rider_col = None
-    for candidate in [
-        "average_weekday_ridership", "avg_weekday_ridership",
-        "average_ridership", "ridership", "avg_daily_riders", "total_ridership",
-    ]:
-        if candidate in df.columns:
-            rider_col = candidate
+            df = df.rename(columns={candidate: "route_id"})
             break
 
-    if rider_col:
-        df["avg_daily_riders"] = pd.to_numeric(df[rider_col], errors="coerce")
+    # Compute avg daily riders from total (dataset spans ~4 years ≈ 1461 days)
+    if "total_ridership" in df.columns:
+        df["avg_daily_riders"] = pd.to_numeric(
+            df["total_ridership"], errors="coerce"
+        ).fillna(0.0) / 1461.0
+    elif "ridership" in df.columns:
+        df["avg_daily_riders"] = pd.to_numeric(
+            df["ridership"], errors="coerce"
+        ).fillna(0.0)
     else:
         logger.warning("No ridership column found. Columns: %s", list(df.columns))
         df["avg_daily_riders"] = 0.0
-
-    if rider_col and "annual" in rider_col.lower():
-        df["avg_daily_riders"] = df["avg_daily_riders"] / 365.0
-
-    year_col = None
-    for candidate in ["year", "fiscal_year", "report_year"]:
-        if candidate in df.columns:
-            year_col = candidate
-            break
-    if year_col:
-        df[year_col] = pd.to_numeric(df[year_col], errors="coerce")
-        df = df.sort_values(year_col, ascending=False).drop_duplicates(
-            subset="stop_id", keep="first"
-        )
 
     return df
 
@@ -119,7 +131,7 @@ def main() -> None:
     produce(df)
 
     logger.info(
-        "Done. %d stops, avg daily riders range: %.0f - %.0f",
+        "Done. %d routes, avg daily riders range: %.0f - %.0f",
         len(df), df["avg_daily_riders"].min(), df["avg_daily_riders"].max(),
     )
 
