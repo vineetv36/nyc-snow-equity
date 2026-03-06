@@ -1,7 +1,7 @@
 """Download NYC DOT Automated Pedestrian Count data and produce to Kafka.
 
-Fetches hourly pedestrian counts from NYC Open Data, aggregates to daily
-averages per counter location, and streams to Kafka for PostGIS loading.
+Fetches 6 months of hourly pedestrian counts from NYC Open Data,
+aggregates to daily averages per counter location, and streams to Kafka.
 """
 
 import logging
@@ -25,15 +25,22 @@ SOCRATA_APP_TOKEN = os.environ.get("SOCRATA_APP_TOKEN", "")
 BASE_URL = f"https://{SOCRATA_DOMAIN}/resource/{PED_DATASET_ID}.json"
 PAGE_SIZE = 50_000
 
+# Only fetch last 6 months of data
+DATE_FILTER = "counttime >= '2024-07-01T00:00:00'"
+
 
 def fetch_all_records() -> pd.DataFrame:
-    """Paginate through the pedestrian counts dataset."""
+    """Paginate through the pedestrian counts dataset (last 6 months)."""
     all_records: list[dict] = []
     offset = 0
 
     while True:
         logger.info("Fetching offset %d ...", offset)
-        params: dict = {"$limit": PAGE_SIZE, "$offset": offset}
+        params: dict = {
+            "$limit": PAGE_SIZE,
+            "$offset": offset,
+            "$where": DATE_FILTER,
+        }
         if SOCRATA_APP_TOKEN:
             params["$$app_token"] = SOCRATA_APP_TOKEN
 
@@ -44,6 +51,7 @@ def fetch_all_records() -> pd.DataFrame:
         if not page:
             break
         all_records.extend(page)
+        logger.info("  got %d records (total: %d)", len(page), len(all_records))
         if len(page) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
@@ -136,7 +144,7 @@ def produce(gdf: gpd.GeoDataFrame) -> None:
 
 
 def main() -> None:
-    logger.info("Starting NYC pedestrian count download")
+    logger.info("Starting NYC pedestrian count download (last 6 months)")
     df = fetch_all_records()
     if df.empty:
         logger.warning("No records returned")

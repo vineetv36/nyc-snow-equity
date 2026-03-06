@@ -1,10 +1,7 @@
 """Download MTA bus ridership data and produce to Kafka.
 
-Fetches bus ridership from data.ny.gov, aggregates by route,
-and streams records to Kafka.
-
-Uses server-side SoQL aggregation to avoid downloading millions of
-hourly rows.  Falls back to CSV bulk download if SoQL fails.
+Fetches 6 months of bus ridership from data.ny.gov, aggregates by route
+via server-side SoQL, and streams records to Kafka.
 """
 
 import io
@@ -25,93 +22,44 @@ SOCRATA_DOMAIN = "data.ny.gov"
 SOCRATA_APP_TOKEN = os.environ.get("SOCRATA_APP_TOKEN", "")
 
 SODA_URL = f"https://{SOCRATA_DOMAIN}/resource/{MTA_RIDERSHIP_DATASET_ID}.csv"
-CSV_DOWNLOAD_URL = (
-    f"https://{SOCRATA_DOMAIN}/api/views/{MTA_RIDERSHIP_DATASET_ID}"
-    "/rows.csv?accessType=DOWNLOAD"
-)
+
+# Only fetch last 6 months of data
+DATE_FILTER = "transit_timestamp >= '2024-07-01T00:00:00'"
 
 
-def fetch_aggregated() -> pd.DataFrame:
-    """Fetch ridership pre-aggregated by route using SoQL (fast)."""
+def fetch_all_records() -> pd.DataFrame:
+    """Fetch ridership aggregated by route for the last 6 months."""
     params: dict = {
         "$select": "bus_route, sum(ridership) as total_ridership, sum(transfers) as total_transfers",
+        "$where": DATE_FILTER,
         "$group": "bus_route",
         "$limit": 50000,
     }
     if SOCRATA_APP_TOKEN:
         params["$$app_token"] = SOCRATA_APP_TOKEN
 
-    logger.info("Fetching aggregated ridership via SoQL ...")
+    logger.info("Fetching aggregated ridership via SoQL (last 6 months) ...")
     resp = requests.get(SODA_URL, params=params, timeout=300)
     resp.raise_for_status()
     df = pd.read_csv(io.StringIO(resp.text))
-    if df.empty:
-        raise ValueError("SoQL returned empty result")
-    logger.info("Got %d routes via SoQL aggregation", len(df))
+    logger.info("Got %d routes", len(df))
     return df
-
-
-def fetch_csv_bulk() -> pd.DataFrame:
-    """Stream CSV download in chunks and aggregate locally (fallback)."""
-    logger.info("Falling back to CSV bulk download (streaming) ...")
-
-    agg = {}
-    row_count = 0
-    chunk_iter = pd.read_csv(
-        CSV_DOWNLOAD_URL,
-        usecols=["bus_route", "ridership", "transfers"],
-        dtype={"bus_route": str, "ridership": float, "transfers": float},
-        chunksize=100_000,
-    )
-    for chunk in chunk_iter:
-        row_count += len(chunk)
-        if row_count % 500_000 == 0 or row_count == len(chunk):
-            logger.info("  streamed %d rows so far ...", row_count)
-        partial = chunk.groupby("bus_route", as_index=False).agg(
-            total_ridership=("ridership", "sum"),
-            total_transfers=("transfers", "sum"),
-        )
-        for _, r in partial.iterrows():
-            route = r["bus_route"]
-            if route in agg:
-                agg[route][0] += r["total_ridership"]
-                agg[route][1] += r["total_transfers"]
-            else:
-                agg[route] = [r["total_ridership"], r["total_transfers"]]
-
-    logger.info("Streamed %d total rows, aggregated to %d routes", row_count, len(agg))
-    df = pd.DataFrame(
-        [(k, v[0], v[1]) for k, v in agg.items()],
-        columns=["bus_route", "total_ridership", "total_transfers"],
-    )
-    return df
-
-
-def fetch_all_records() -> pd.DataFrame:
-    """Fetch MTA ridership, preferring server-side aggregation."""
-    try:
-        return fetch_aggregated()
-    except Exception as exc:
-        logger.warning("SoQL aggregation failed: %s: %s", type(exc).__name__, exc)
-        logger.info("Using CSV streaming fallback ...")
-        return fetch_csv_bulk()
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize columns and compute average daily riders."""
     df.columns = [c.lower().strip() for c in df.columns]
 
-    # Rename route column
     for candidate in ["bus_route", "route", "route_id"]:
         if candidate in df.columns:
             df = df.rename(columns={candidate: "route_id"})
             break
 
-    # Compute avg daily riders from total (dataset spans ~4 years ≈ 1461 days)
+    # 6 months ≈ 183 days
     if "total_ridership" in df.columns:
         df["avg_daily_riders"] = pd.to_numeric(
             df["total_ridership"], errors="coerce"
-        ).fillna(0.0) / 1461.0
+        ).fillna(0.0) / 183.0
     elif "ridership" in df.columns:
         df["avg_daily_riders"] = pd.to_numeric(
             df["ridership"], errors="coerce"
