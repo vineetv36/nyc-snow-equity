@@ -1,7 +1,7 @@
 PYTHON ?= python3
 PIP ?= pip3
 
-.PHONY: help setup services services-stop db db-stop db-logs kafka-logs \
+.PHONY: help setup services services-stop db db-stop db-reset db-logs kafka-logs \
         download-all consume download-lion download-ridership download-stops \
         download-plow download-pedestrian download-census pipeline api live test
 
@@ -36,6 +36,15 @@ db: ## Start PostgreSQL + PostGIS only
 
 db-stop: ## Stop all services
 	docker compose down
+
+db-reset: ## Drop and recreate all tables (empty the database)
+	docker compose exec postgres psql -U snow_user -d nyc_snow_equity -c " \
+		DO \$$\$$ DECLARE r RECORD; BEGIN \
+			FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP \
+				EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE'; \
+			END LOOP; \
+		END \$$\$$;"
+	@echo "All tables dropped. Database is empty."
 
 db-logs: ## Tail database logs
 	docker compose logs -f postgres
