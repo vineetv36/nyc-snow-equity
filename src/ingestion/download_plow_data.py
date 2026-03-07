@@ -24,19 +24,64 @@ BASE_URL = f"https://{SOCRATA_DOMAIN}/resource/{PLOWNYC_DATASET_ID}.json"
 PAGE_SIZE = 50_000
 
 
+def _discover_columns() -> dict:
+    """Fetch one record to discover the actual column names."""
+    params: dict = {"$limit": 1}
+    if SOCRATA_APP_TOKEN:
+        params["$$app_token"] = SOCRATA_APP_TOKEN
+    resp = requests.get(BASE_URL, params=params, timeout=60)
+    resp.raise_for_status()
+    rows = resp.json()
+    if not rows:
+        return {}
+    return rows[0]
+
+
+def _find_column(sample: dict, candidates: list[str]) -> str | None:
+    """Return the first column name from *candidates* found in *sample*."""
+    keys_lower = {k.lower(): k for k in sample}
+    for c in candidates:
+        if c.lower() in keys_lower:
+            return keys_lower[c.lower()]
+    return None
+
+
 def fetch_all_records() -> pd.DataFrame:
     """Fetch PlowNYC records via SoQL (latest plowing per segment)."""
-    # The dataset can be huge — use server-side aggregation to get
-    # the most recent plow timestamp per physical_id.
-    params: dict = {
-        "$select": "physical_id, max(timestamp) as last_plowed",
-        "$group": "physical_id",
-        "$limit": PAGE_SIZE,
-    }
+    # Discover schema first so we use the real column names.
+    sample = _discover_columns()
+    if not sample:
+        logger.warning("Could not fetch sample record — dataset may be empty")
+        return pd.DataFrame()
+
+    logger.info("Discovered columns: %s", list(sample.keys()))
+
+    id_col = _find_column(sample, ["physical_id", "physicalid", "segment_id"])
+    ts_col = _find_column(
+        sample, ["timestamp", "last_updated", "last_plowed", "date_time", "datetime"]
+    )
+
+    if id_col and ts_col:
+        # Server-side aggregation: latest plow timestamp per segment.
+        params: dict = {
+            "$select": f"{id_col}, max({ts_col}) as last_plowed",
+            "$group": id_col,
+            "$limit": PAGE_SIZE,
+        }
+    else:
+        # Fallback: just grab raw records.
+        logger.warning(
+            "Could not identify id/timestamp columns (id=%s, ts=%s). "
+            "Falling back to raw fetch.",
+            id_col,
+            ts_col,
+        )
+        params = {"$limit": PAGE_SIZE}
+
     if SOCRATA_APP_TOKEN:
         params["$$app_token"] = SOCRATA_APP_TOKEN
 
-    logger.info("Fetching PlowNYC aggregated data ...")
+    logger.info("Fetching PlowNYC data (params=%s) ...", params)
     resp = requests.get(BASE_URL, params=params, timeout=300)
     resp.raise_for_status()
     records = resp.json()
@@ -51,9 +96,19 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize column names and types."""
     df.columns = [c.lower().strip() for c in df.columns]
 
+    # Standardise the segment-id column to "physical_id".
+    for alias in ("physicalid", "segment_id", "physical_id"):
+        if alias in df.columns:
+            df = df.rename(columns={alias: "physical_id"})
+            break
     if "physical_id" in df.columns:
         df["physical_id"] = df["physical_id"].astype(str)
 
+    # Standardise any timestamp column to "last_plowed".
+    for alias in ("last_plowed", "last_updated", "timestamp", "date_time", "datetime"):
+        if alias in df.columns:
+            df = df.rename(columns={alias: "last_plowed"})
+            break
     if "last_plowed" in df.columns:
         df["last_plowed"] = pd.to_datetime(df["last_plowed"], utc=True, errors="coerce")
 
