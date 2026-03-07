@@ -4,8 +4,11 @@ Fetches plowing timestamps per street segment (PHYSICAL_ID) from NYC Open Data.
 Each record represents when a street segment was last plowed by a DSNY vehicle.
 """
 
+from __future__ import annotations
+
 import logging
 import os
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
