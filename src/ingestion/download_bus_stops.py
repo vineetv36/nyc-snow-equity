@@ -131,9 +131,10 @@ def produce(gdf: gpd.GeoDataFrame) -> None:
     producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
     topic = TOPICS["bus_stops"]
 
+    geom_col = gdf.geometry.name
     for _, row in gdf.iterrows():
-        record = row.drop("geom").to_dict()
-        record["geom"] = row.geom.wkt
+        record = row.drop(geom_col).to_dict()
+        record["geom"] = row.geometry.wkt
         producer.send(topic, value=serialize(record))
 
     producer.send(topic, value=END_OF_STREAM.encode("utf-8"))

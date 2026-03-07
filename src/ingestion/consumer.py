@@ -40,7 +40,8 @@ def _load_lion(records: list[dict]) -> None:
     engine = create_engine(DB_URL)
     df = pd.DataFrame(records)
     geom = gpd.GeoSeries.from_wkt(df.pop("geom"), crs="EPSG:4326")
-    gdf = gpd.GeoDataFrame(df, geometry=geom.rename("geom"), crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(df, geometry=geom, crs="EPSG:4326")
+    gdf = gdf.rename_geometry("geom")
 
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE street_segments CASCADE"))
@@ -60,7 +61,8 @@ def _load_bus_stops(records: list[dict]) -> None:
     engine = create_engine(DB_URL)
     df = pd.DataFrame(records)
     geom = gpd.GeoSeries.from_wkt(df.pop("geom"), crs="EPSG:4326")
-    gdf = gpd.GeoDataFrame(df, geometry=geom.rename("geom"), crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(df, geometry=geom, crs="EPSG:4326")
+    gdf = gdf.rename_geometry("geom")
 
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE bus_stops CASCADE"))
@@ -81,7 +83,8 @@ def _load_pedestrian(records: list[dict]) -> None:
     engine = create_engine(DB_URL)
     df = pd.DataFrame(records)
     geom = gpd.GeoSeries.from_wkt(df.pop("geom"), crs="EPSG:4326")
-    gdf = gpd.GeoDataFrame(df, geometry=geom.rename("geom"), crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(df, geometry=geom, crs="EPSG:4326")
+    gdf = gdf.rename_geometry("geom")
 
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE pedestrian_counters CASCADE"))
@@ -97,7 +100,8 @@ def _load_census(records: list[dict]) -> None:
     engine = create_engine(DB_URL)
     df = pd.DataFrame(records)
     geom = gpd.GeoSeries.from_wkt(df.pop("geom"), crs="EPSG:4326")
-    gdf = gpd.GeoDataFrame(df, geometry=geom.rename("geom"), crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(df, geometry=geom, crs="EPSG:4326")
+    gdf = gdf.rename_geometry("geom")
 
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE census_tracts CASCADE"))
